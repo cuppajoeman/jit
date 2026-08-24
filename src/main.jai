@@ -4,6 +4,12 @@
 #import "String";
 #import "tbx/file";
 
+#if OS == .WINDOWS {
+    Windows :: #import "Windows";
+} else #if OS_IS_UNIX {
+    POSIX :: #import "POSIX";
+}
+
 Process :: #import "Process";
 
 #scope_module
@@ -34,9 +40,11 @@ jit_run :: (args: [] string) -> bool {
     }
 
     if command == "clone" return run_clone(args);
+    if command == "pull" return run_pull(args);
+    if command == "push" return run_push(args);
     if command == "add" return run_add(args);
     if command == "status" return run_status(args);
-    if command == "catch-up-submodules" return run_catch_up_submodules(args);
+    if command == "latest" return run_latest(args);
     if command == "commit" return run_commit(args);
     if command == "chunk" || command == "chunk-all" || command == "chunk_all" return run_chunk(args);
     if command == "unchunk" || command == "unchunk-all" || command == "unchunk_all" return run_unchunk(args);
@@ -49,10 +57,12 @@ print_usage :: () {
 usage:
   jit <git-command> [args...]
   jit clone <url> [args...]       runs git clone --recurse-submodules -j8 ...
+  jit pull [args...]              pull and reconcile all nested submodules
+  jit push [args...]              refuse parent commits with unpublished submodule commits
   jit add [args...]               refuses files over 50 MiB before staging
   jit status [args...]            clarifies submodule commit direction
-  jit catch-up-submodules         checkout main and pull submodules pointing old
-  jit commit [args...]            refuses staged files over 50 MiB
+  jit latest                      pull this repo and every nested submodule's latest main
+  jit commit [args...]            refuses detached HEAD and staged files over 50 MiB
   jit chunk [--size 50M] [files]  split files into <file>.parts directories
   jit chunk-all [--size 50M]      split all files over the size in this tree
   jit unchunk [parts-dirs]        reconstruct files from .parts directories
@@ -71,6 +81,654 @@ run_clone :: (args: [] string) -> bool {
 
     for i: 2..args.count - 1 array_add(*command, args[i]);
     return run_process_command(command);
+}
+
+run_push :: (args: [] string) -> bool {
+    repo_root, root_ok := current_repo_root();
+    if !root_ok {
+        print("jit push: not inside a Git repository.\n");
+        return false;
+    }
+
+    for i: 2..args.count - 1 {
+        arg := args[i];
+        if arg == "--no-recurse-submodules" || begins_with(arg, "--recurse-submodules") {
+            print("jit push: submodule recursion options cannot override the publication guard.\n");
+            print("Use plain `git push` if you intentionally need to bypass jit's guard.\n");
+            return false;
+        }
+    }
+
+    // Git's check uses remote-tracking refs, so refresh every initialized
+    // submodule first. This prevents a deleted/rewritten remote branch from
+    // passing merely because a stale origin/* ref still exists locally.
+    refresh: [..] string;
+    array_add(*refresh, "git");
+    array_add(*refresh, "submodule");
+    array_add(*refresh, "foreach");
+    array_add(*refresh, "--recursive");
+    array_add(*refresh, "git fetch --quiet --prune");
+    if !run_process_command(refresh) {
+        print("jit push: could not refresh every submodule remote; refusing an unverified parent push.\n");
+        return false;
+    }
+
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "push");
+    array_add(*command, "--recurse-submodules=check");
+    for i: 2..args.count - 1 array_add(*command, args[i]);
+
+    result, output, error := Process.run_command(..command, capture_and_return_output = true);
+    if output print("%", output);
+    if error write_string(error, to_standard_error = true);
+
+    if result.type == .EXITED && result.exit_code == 0 return true;
+
+    if unpublished_submodule_push_error(output) || unpublished_submodule_push_error(error) {
+        print(#string END
+
+jit push: blocked the parent push because it references a submodule commit that
+is not published on a submodule remote-tracking branch. A fresh recursive clone
+would be unable to check out that commit.
+
+Push each submodule path listed by Git from inside that repository, then return
+here and run `jit push` again. jit deliberately checks rather than automatically
+pushing submodules, because it cannot safely choose their intended branches or
+remotes for you.
+END);
+    }
+
+    return false;
+}
+
+unpublished_submodule_push_error :: (text: string) -> bool {
+    return (find_index_from_left(text, "following submodule paths contain changes") >= 0 &&
+            find_index_from_left(text, "found on any remote") >= 0) ||
+           find_index_from_left(text, "can not be found on any remote") >= 0 ||
+           find_index_from_left(text, "cannot be found on any remote") >= 0 ||
+           find_index_from_left(text, "not found on any remote") >= 0;
+}
+
+run_pull :: (args: [] string) -> bool {
+    repo_root, root_ok := current_repo_root();
+    if !root_ok {
+        print("jit pull: not inside a Git repository.\n");
+        return false;
+    }
+
+    before := collect_submodule_tree(repo_root);
+
+    pull: [..] string;
+    array_add(*pull, "git");
+    array_add(*pull, "pull");
+    // Pull only the parent here. When the new parent commit references an
+    // unpublished submodule commit, Git's recursive pull aborts before the
+    // parent can advance and leaves the user with only "not our ref". We do
+    // the recursive checkout ourselves below so jit can explain that case.
+    array_add(*pull, "--no-recurse-submodules");
+    for i: 2..args.count - 1 array_add(*pull, args[i]);
+    if !run_process_command(pull) return false;
+
+    if !run_submodule_sync() return false;
+
+    // A recursive update can expose a layout migration one repository at a
+    // time. Retry after confirmed cleanup so deeper migrations are handled too.
+    for attempt: 1..8 {
+        update_ok := run_submodule_update(repo_root);
+        current := collect_submodule_tree(repo_root);
+        stale := collect_stale_submodules(before, current, repo_root);
+
+        if stale.count == 0 return update_ok;
+
+        targets := build_cleanup_targets(stale, current);
+        if targets.count == 0 return update_ok;
+        if !confirm_submodule_cleanup(targets, repo_root) {
+            print("jit pull: cleanup declined; the submodule update is incomplete.\n");
+            return false;
+        }
+        if !clean_stale_submodules(targets, stale, repo_root) return false;
+        if !run_submodule_sync() return false;
+    }
+
+    print("jit pull: too many consecutive submodule layout migrations; stopping.\n");
+    return false;
+}
+
+Submodule_Entry :: struct {
+    owner_repo: string;
+    name: string;
+    local_path: string;
+    work_path: string;
+    metadata_path: string;
+}
+
+Submodule_Cleanup_Target :: struct {
+    work_path: string;
+    metadata_path: string;
+    replaces_old_layout: bool;
+}
+
+current_repo_root :: () -> (string, bool) {
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "rev-parse");
+    array_add(*command, "--show-toplevel");
+
+    ok, output, error := run_capture(command);
+    if !ok return "", false;
+    return trim_right(output, " \t\r\n"), true;
+}
+
+run_submodule_sync :: () -> bool {
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "submodule");
+    array_add(*command, "sync");
+    array_add(*command, "--recursive");
+    return run_process_command(command);
+}
+
+run_submodule_update :: (repo_root: string) -> bool {
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "submodule");
+    array_add(*command, "update");
+    array_add(*command, "--init");
+    array_add(*command, "--recursive");
+
+    result, output, error := Process.run_command(..command, capture_and_return_output = true);
+    if output print("%", output);
+    if error write_string(error, to_standard_error = true);
+
+    if result.type == .EXITED && result.exit_code == 0 return true;
+
+    if unavailable_pinned_commit_error(output) || unavailable_pinned_commit_error(error) {
+        explain_unavailable_pinned_commits(repo_root);
+    }
+    return false;
+}
+
+Missing_Pinned_Submodule :: struct {
+    path: string;
+    commit: string;
+    url: string;
+}
+
+unavailable_pinned_commit_error :: (text: string) -> bool {
+    return find_index_from_left(text, "not our ref") >= 0 ||
+           find_index_from_left(text, "did not contain") >= 0 ||
+           find_index_from_left(text, "Direct fetching of that commit failed") >= 0;
+}
+
+explain_unavailable_pinned_commits :: (repo_root: string) {
+    missing := collect_missing_pinned_submodules(repo_root);
+
+    print("\njit pull: the parent repository was updated, but its exact submodule checkout is unavailable.\n");
+    print("A Git parent commit records an exact commit for every submodule, not merely a branch name.\n");
+
+    if missing.count > 0 {
+        print("Git could not obtain these required commits:\n");
+        for item: missing {
+            print("  %\n", item.path);
+            print("    required commit: %\n", item.commit);
+            if item.url print("    configured remote: %\n", item.url);
+        }
+    } else {
+        print("Git reported that at least one required submodule commit is not available from its remote.\n");
+    }
+
+    print(#string END
+
+This normally means the submodule commit was never pushed, was removed by a
+history rewrite, or the parent repository recorded the wrong commit. jit cannot
+invent that missing history or silently substitute another revision.
+
+To repair the exact checkout, push the listed commits to their submodule remotes
+or update the parent repository to reference commits that are published, then run
+`jit pull` again.
+
+If you intentionally want every submodule's newest main instead of the parent's
+pinned revisions, run `jit latest`. That is a different operation and may leave
+the parent repository showing newer submodule commits.
+END);
+}
+
+collect_missing_pinned_submodules :: (repo_root: string) -> [..] Missing_Pinned_Submodule {
+    result: [..] Missing_Pinned_Submodule;
+    entries := collect_submodule_tree(repo_root);
+
+    for entry: entries {
+        commit, commit_ok := recorded_submodule_commit(entry);
+        if !commit_ok continue;
+        if submodule_has_commit(entry, commit) continue;
+
+        url, url_ok := declared_submodule_url(entry);
+        if !url_ok url = "";
+
+        item := Missing_Pinned_Submodule.{
+            path = copy_string(display_path_from_root(entry.work_path, repo_root)),
+            commit = copy_string(commit),
+            url = copy_string(url),
+        };
+        array_add(*result, item);
+    }
+
+    return result;
+}
+
+recorded_submodule_commit :: (entry: Submodule_Entry) -> (string, bool) {
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "-C");
+    array_add(*command, entry.owner_repo);
+    array_add(*command, "rev-parse");
+    array_add(*command, tprint("HEAD:%", entry.local_path));
+
+    ok, output, error := run_capture(command);
+    if !ok return "", false;
+    commit := trim_right(output, " \t\r\n");
+    if commit.count != 40 return "", false;
+    return commit, true;
+}
+
+submodule_has_commit :: (entry: Submodule_Entry, commit: string) -> bool {
+    command: [..] string;
+    array_add(*command, "git");
+
+    if git_work_tree_is_valid(entry.work_path) {
+        array_add(*command, "-C");
+        array_add(*command, entry.work_path);
+    } else {
+        if !entry.metadata_path || !file_exists(entry.metadata_path) return false;
+        array_add(*command, tprint("--git-dir=%", entry.metadata_path));
+    }
+
+    array_add(*command, "cat-file");
+    array_add(*command, "-e");
+    array_add(*command, tprint("%^{commit}", commit));
+    ok, output, error := run_capture(command);
+    return ok;
+}
+
+declared_submodule_url :: (entry: Submodule_Entry) -> (string, bool) {
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "-C");
+    array_add(*command, entry.owner_repo);
+    array_add(*command, "config");
+    array_add(*command, "-f");
+    array_add(*command, ".gitmodules");
+    array_add(*command, "--get");
+    array_add(*command, tprint("submodule.%.url", entry.name));
+
+    ok, output, error := run_capture(command);
+    if !ok return "", false;
+    return trim_right(output, " \t\r\n"), true;
+}
+
+collect_submodule_tree :: (repo_root: string) -> [..] Submodule_Entry {
+    entries: [..] Submodule_Entry;
+    visited: [..] string;
+    collect_submodules_in_repo(repo_root, *entries, *visited);
+    return entries;
+}
+
+collect_submodules_in_repo :: (repo: string, entries: *[..] Submodule_Entry, visited: *[..] string) {
+    for seen: visited.* {
+        if seen == repo return;
+    }
+    array_add(visited, copy_string(repo));
+
+    immediate := collect_immediate_submodules(repo);
+    for entry: immediate {
+        array_add(entries, entry);
+        if git_work_tree_is_valid(entry.work_path) {
+            collect_submodules_in_repo(entry.work_path, entries, visited);
+        }
+    }
+}
+
+collect_immediate_submodules :: (repo: string) -> [..] Submodule_Entry {
+    entries: [..] Submodule_Entry;
+    gitmodules := jit_path_join(repo, ".gitmodules");
+    if !file_exists(gitmodules) return entries;
+
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "-C");
+    array_add(*command, repo);
+    array_add(*command, "config");
+    array_add(*command, "--null");
+    array_add(*command, "-f");
+    array_add(*command, ".gitmodules");
+    array_add(*command, "--get-regexp");
+    array_add(*command, "^submodule\\..*\\.path$");
+
+    ok, output, error := run_capture(command);
+    if !ok && !output return entries;
+
+    records := split_nul(output);
+    for record: records {
+        key, local_path, record_ok := parse_null_config_record(record);
+        if !record_ok continue;
+
+        prefix := "submodule.";
+        suffix := ".path";
+        if !begins_with(key, prefix) || !ends_with(key, suffix) continue;
+        if key.count <= prefix.count + suffix.count continue;
+
+        name := slice(key, prefix.count, key.count - prefix.count - suffix.count);
+        work_path := resolve_path(local_path, repo);
+        metadata_path, metadata_ok := submodule_metadata_path(repo, name);
+        if !metadata_ok metadata_path = "";
+
+        entry := Submodule_Entry.{
+            owner_repo = copy_string(repo),
+            name = copy_string(name),
+            local_path = copy_string(local_path),
+            work_path = copy_string(work_path),
+            metadata_path = copy_string(metadata_path),
+        };
+        array_add(*entries, entry);
+    }
+
+    return entries;
+}
+
+parse_null_config_record :: (record: string) -> (key: string, value: string, ok: bool) {
+    newline := find_index_from_left(record, #char "\n");
+    if newline <= 0 || newline + 1 >= record.count return "", "", false;
+    return slice(record, 0, newline), slice(record, newline + 1, record.count - newline - 1), true;
+}
+
+submodule_metadata_path :: (repo: string, module_name_or_path: string) -> (string, bool) {
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "-C");
+    array_add(*command, repo);
+    array_add(*command, "rev-parse");
+    array_add(*command, "--git-path");
+    array_add(*command, tprint("modules/%", module_name_or_path));
+
+    ok, output, error := run_capture(command);
+    if !ok return "", false;
+    path := trim_right(output, " \t\r\n");
+    return resolve_path(path, repo), true;
+}
+
+git_work_tree_is_valid :: (path: string) -> bool {
+    if !file_exists(path) return false;
+
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "-C");
+    array_add(*command, path);
+    array_add(*command, "rev-parse");
+    array_add(*command, "--is-inside-work-tree");
+    ok, output, error := run_capture(command);
+    return ok && trim_right(output, " \t\r\n") == "true";
+}
+
+collect_stale_submodules :: (before: [] Submodule_Entry, current: [] Submodule_Entry, repo_root: string) -> [..] Submodule_Entry {
+    stale: [..] Submodule_Entry;
+
+    for old: before {
+        if submodule_work_path_present(current, old.work_path) continue;
+        if !file_exists(old.work_path) && (!old.metadata_path || !file_exists(old.metadata_path)) continue;
+        add_unique_submodule_entry(*stale, old);
+    }
+
+    visited: [..] string;
+    collect_stale_local_configs(repo_root, current, *stale, *visited);
+    return stale;
+}
+
+collect_stale_local_configs :: (repo: string, current: [] Submodule_Entry, stale: *[..] Submodule_Entry, visited: *[..] string) {
+    for seen: visited.* {
+        if seen == repo return;
+    }
+    array_add(visited, copy_string(repo));
+
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "-C");
+    array_add(*command, repo);
+    array_add(*command, "config");
+    array_add(*command, "--null");
+    array_add(*command, "--get-regexp");
+    array_add(*command, "^submodule\\..*\\.url$");
+
+    ok, output, error := run_capture(command);
+    if ok || output {
+        records := split_nul(output);
+        for record: records {
+            key, url, record_ok := parse_null_config_record(record);
+            if !record_ok continue;
+
+            prefix := "submodule.";
+            suffix := ".url";
+            if !begins_with(key, prefix) || !ends_with(key, suffix) continue;
+            if key.count <= prefix.count + suffix.count continue;
+
+            name := slice(key, prefix.count, key.count - prefix.count - suffix.count);
+            if submodule_name_present_in_owner(current, repo, name) continue;
+
+            metadata_path, metadata_ok := submodule_metadata_path(repo, name);
+            if !metadata_ok metadata_path = "";
+
+            work_path := "";
+            if metadata_path && file_exists(metadata_path) {
+                show: [..] string;
+                array_add(*show, "git");
+                array_add(*show, tprint("--git-dir=%", metadata_path));
+                array_add(*show, "rev-parse");
+                array_add(*show, "--show-toplevel");
+                show_ok, show_output, show_error := run_capture(show);
+                if show_ok work_path = trim_right(show_output, " \t\r\n");
+            }
+            // A local config section does not record its old path. Recover it
+            // from the submodule repository's core.worktree instead of guessing
+            // that the section name and path were identical.
+            if !work_path continue;
+            if !file_exists(work_path) && (!metadata_path || !file_exists(metadata_path)) continue;
+
+            entry := Submodule_Entry.{
+                owner_repo = copy_string(repo),
+                name = copy_string(name),
+                local_path = copy_string(name),
+                work_path = copy_string(work_path),
+                metadata_path = copy_string(metadata_path),
+            };
+            add_unique_submodule_entry(stale, entry);
+        }
+    }
+
+    for entry: current {
+        if entry.owner_repo != repo continue;
+        if git_work_tree_is_valid(entry.work_path) {
+            collect_stale_local_configs(entry.work_path, current, stale, visited);
+        }
+    }
+}
+
+submodule_work_path_present :: (entries: [] Submodule_Entry, work_path: string) -> bool {
+    for entry: entries {
+        if entry.work_path == work_path return true;
+    }
+    return false;
+}
+
+submodule_name_present_in_owner :: (entries: [] Submodule_Entry, owner_repo: string, name: string) -> bool {
+    for entry: entries {
+        if entry.owner_repo == owner_repo && entry.name == name return true;
+    }
+    return false;
+}
+
+add_unique_submodule_entry :: (entries: *[..] Submodule_Entry, candidate: Submodule_Entry) {
+    for entry: entries.* {
+        if entry.owner_repo == candidate.owner_repo && entry.name == candidate.name && entry.work_path == candidate.work_path return;
+    }
+    array_add(entries, candidate);
+}
+
+build_cleanup_targets :: (stale: [] Submodule_Entry, current: [] Submodule_Entry) -> [..] Submodule_Cleanup_Target {
+    targets: [..] Submodule_Cleanup_Target;
+
+    for old: stale {
+        target_work_path := old.work_path;
+        target_metadata_path := old.metadata_path;
+        replacement := false;
+        best_parent_length := 0;
+
+        for now: current {
+            if !path_is_strictly_inside(old.work_path, now.work_path) continue;
+            if now.work_path.count <= best_parent_length continue;
+            target_work_path = now.work_path;
+            target_metadata_path = now.metadata_path;
+            replacement = true;
+            best_parent_length = now.work_path.count;
+        }
+
+        duplicate := false;
+        for target: targets {
+            if target.work_path == target_work_path {
+                duplicate = true;
+                break;
+            }
+        }
+        if duplicate continue;
+
+        target := Submodule_Cleanup_Target.{
+            work_path = copy_string(target_work_path),
+            metadata_path = copy_string(target_metadata_path),
+            replaces_old_layout = replacement,
+        };
+        array_add(*targets, target);
+    }
+
+    return targets;
+}
+
+path_is_strictly_inside :: (child: string, parent: string) -> bool {
+    if child.count <= parent.count return false;
+    if !begins_with(child, parent) return false;
+    return child[parent.count] == #char "/" || child[parent.count] == #char "\\";
+}
+
+display_path_from_root :: (path: string, repo_root: string) -> string {
+    if path_is_strictly_inside(path, repo_root) return slice(path, repo_root.count + 1, path.count - repo_root.count - 1);
+    return path;
+}
+
+confirm_submodule_cleanup :: (targets: [] Submodule_Cleanup_Target, repo_root: string) -> bool {
+    print("\njit pull: the pulled commits changed the submodule layout.\n");
+    print("Git left obsolete non-empty directories that block a complete update:\n");
+    for target: targets {
+        display := display_path_from_root(target.work_path, repo_root);
+        if target.replaces_old_layout {
+            print("  %  (must be replaced with the new submodule layout)\n", display);
+        } else {
+            print("  %  (no longer exists as a submodule)\n", display);
+        }
+    }
+    print("\nDelete these directories and their stale Git metadata, then continue? [y/N] ");
+    flush_standard_output();
+
+    answer, answer_ok := read_standard_input_line();
+    if !answer_ok return false;
+    answer = trim_left(trim_right(answer, " \t\r\n"), " \t");
+    return equal_nocase(answer, "y") || equal_nocase(answer, "yes");
+}
+
+clean_stale_submodules :: (targets: [] Submodule_Cleanup_Target, stale: [] Submodule_Entry, repo_root: string) -> bool {
+    for target: targets {
+        if !safe_submodule_work_path(target.work_path, repo_root) {
+            print("jit pull: refusing unsafe cleanup path '%'.\n", target.work_path);
+            return false;
+        }
+        if target.metadata_path && !safe_submodule_metadata_path(target.metadata_path) {
+            print("jit pull: refusing unsafe Git metadata path '%'.\n", target.metadata_path);
+            return false;
+        }
+    }
+
+    for target: targets {
+        if file_exists(target.work_path) {
+            if !delete_directory(target.work_path) {
+                print("jit pull: could not delete obsolete directory '%'.\n", target.work_path);
+                return false;
+            }
+        }
+        if target.metadata_path && file_exists(target.metadata_path) {
+            if !delete_directory(target.metadata_path) {
+                print("jit pull: could not delete stale Git metadata '%'.\n", target.metadata_path);
+                return false;
+            }
+        }
+    }
+
+    for old: stale {
+        if !git_work_tree_is_valid(old.owner_repo) continue;
+        remove_config: [..] string;
+        array_add(*remove_config, "git");
+        array_add(*remove_config, "-C");
+        array_add(*remove_config, old.owner_repo);
+        array_add(*remove_config, "config");
+        array_add(*remove_config, "--remove-section");
+        array_add(*remove_config, tprint("submodule.%", old.name));
+        result := Process.run_command(..remove_config, capture_and_return_output = true);
+    }
+
+    return true;
+}
+
+safe_submodule_work_path :: (path: string, repo_root: string) -> bool {
+    if !path || path == "/" || path == repo_root return false;
+    return path_is_strictly_inside(path, repo_root);
+}
+
+safe_submodule_metadata_path :: (path: string) -> bool {
+    if !path || path == "/" return false;
+    return find_index_from_left(path, "/modules/") >= 0;
+}
+
+read_standard_input_line :: () -> (string, bool) {
+    builder: String_Builder;
+    read_any := false;
+
+    while true {
+        c: u8;
+        did_read: s64;
+        #if OS == .WINDOWS {
+            count: Windows.DWORD;
+            input := Windows.GetStdHandle(Windows.STD_INPUT_HANDLE);
+            read_ok := Windows.ReadFile(input, *c, 1, *count);
+            if !read_ok return builder_to_string(*builder), read_any;
+            did_read = count;
+        } else #if OS_IS_UNIX {
+            did_read = POSIX.read(POSIX.STDIN_FILENO, *c, 1);
+        } else {
+            #assert(false, "Unsupported platform");
+        }
+
+        if did_read <= 0 return builder_to_string(*builder), read_any;
+        read_any = true;
+        if c == #char "\r" continue;
+        if c == #char "\n" return builder_to_string(*builder), true;
+        append(*builder, c);
+    }
+
+    return builder_to_string(*builder), read_any;
+}
+
+flush_standard_output :: () {
+    #if OS == .WINDOWS {
+        Windows.FlushFileBuffers(Windows.GetStdHandle(Windows.STD_OUTPUT_HANDLE));
+    } else #if OS_IS_UNIX {
+        POSIX.fflush(null);
+    }
 }
 
 run_add :: (args: [] string) -> bool {
@@ -99,45 +757,111 @@ run_status :: (args: [] string) -> bool {
     return false;
 }
 
-run_catch_up_submodules :: (args: [] string) -> bool {
-    old_submodules := collect_changed_submodules_with_direction(.OLD);
-    if old_submodules.count == 0 {
-        print("jit: no submodules are pointing to old commits.\n");
-        return true;
+run_latest :: (args: [] string) -> bool {
+    repo_root, root_ok := current_repo_root();
+    if !root_ok {
+        print("jit latest: not inside a Git repository.\n");
+        return false;
     }
 
-    ok := true;
-    for path: old_submodules {
-        print("jit: catching up %\n", path);
+    print("jit: updating current repository\n");
 
-        checkout: [..] string;
-        array_add(*checkout, "git");
-        array_add(*checkout, "-C");
-        array_add(*checkout, path);
-        array_add(*checkout, "checkout");
-        array_add(*checkout, "main");
-        if !run_process_command(checkout) {
-            ok = false;
-            continue;
-        }
+    checkout: [..] string;
+    array_add(*checkout, "git");
+    array_add(*checkout, "-C");
+    array_add(*checkout, repo_root);
+    array_add(*checkout, "checkout");
+    array_add(*checkout, "main");
+    if !run_process_command(checkout) return false;
 
-        pull: [..] string;
-        array_add(*pull, "git");
-        array_add(*pull, "-C");
-        array_add(*pull, path);
-        array_add(*pull, "pull");
-        if !run_process_command(pull) {
-            ok = false;
-            continue;
-        }
+    pull: [..] string;
+    array_add(*pull, "git");
+    array_add(*pull, "-C");
+    array_add(*pull, repo_root);
+    array_add(*pull, "pull");
+    array_add(*pull, "--no-recurse-submodules");
+    if !run_process_command(pull) return false;
+
+    if !all_submodules_initialized() return false;
+
+    latest: [..] string;
+    array_add(*latest, "git");
+    array_add(*latest, "submodule");
+    array_add(*latest, "foreach");
+    array_add(*latest, "--recursive");
+    array_add(*latest, "git checkout main && git pull && git submodule update --init --recursive");
+    return run_process_command(latest);
+}
+
+all_submodules_initialized :: () -> bool {
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "submodule");
+    array_add(*command, "status");
+    array_add(*command, "--recursive");
+
+    ok, output, error := run_capture(command);
+    if !ok {
+        print("jit latest: could not inspect the submodule tree.\n");
+        if error print("%", error);
+        return false;
     }
 
-    return ok;
+    at_line_start := true;
+    for c: output {
+        if at_line_start && c == #char "-" {
+            print("jit latest: the submodule tree is not fully initialized. Run `jit pull` first.\n");
+            return false;
+        }
+        at_line_start = c == #char "\n";
+    }
+
+    return true;
 }
 
 run_commit :: (args: [] string) -> bool {
+    if !preflight_commit_has_attached_head() return false;
     if !preflight_staged_file_sizes() return false;
     return run_git_forward(args, start_index = 1);
+}
+
+preflight_commit_has_attached_head :: () -> bool {
+    repo_root, root_ok := current_repo_root();
+    if !root_ok {
+        print("jit commit: not inside a Git repository.\n");
+        return false;
+    }
+
+    command: [..] string;
+    array_add(*command, "git");
+    array_add(*command, "symbolic-ref");
+    array_add(*command, "--quiet");
+    array_add(*command, "--short");
+    array_add(*command, "HEAD");
+
+    attached, branch, error := run_capture(command);
+    if attached return true;
+
+    revision_command: [..] string;
+    array_add(*revision_command, "git");
+    array_add(*revision_command, "rev-parse");
+    array_add(*revision_command, "--short");
+    array_add(*revision_command, "HEAD");
+    revision_ok, revision, revision_error := run_capture(revision_command);
+    if revision_ok revision = trim_right(revision, " \t\r\n");
+    else revision = "the current commit";
+
+    print("jit commit: refusing to commit while HEAD is detached at %.\n", revision);
+    print(#string END
+A detached commit does not belong to a branch and can be left behind when you
+checkout another revision. Create a branch at the current commit first:
+
+  git switch -c <branch-name>
+
+Then rerun `jit commit`. If detached mode is intentional, such as during a
+rebase, use plain `git commit` to bypass this guard explicitly.
+END);
+    return false;
 }
 
 run_git_forward :: (args: [] string, start_index: int) -> bool {
@@ -398,74 +1122,6 @@ submodule_is_ancestor :: (path: string, maybe_ancestor: string, commit: string) 
 
     result := Process.run_command(..command, capture_and_return_output = true);
     return result.type == .EXITED && result.exit_code == 0;
-}
-
-collect_changed_submodules_with_direction :: (target_direction: Submodule_Direction) -> [..] string {
-    results: [..] string;
-
-    command: [..] string;
-    array_add(*command, "git");
-    array_add(*command, "status");
-    array_add(*command, "--porcelain=v1");
-    array_add(*command, "-z");
-
-    ok, output, error := run_capture(command);
-    if !ok return results;
-
-    paths := parse_status_z_changed_paths(output);
-    for path: paths {
-        if !is_recorded_submodule(path) continue;
-
-        direction, direction_ok := submodule_direction(path);
-        if direction_ok && direction == target_direction array_add(*results, copy_string(path));
-    }
-
-    return results;
-}
-
-is_recorded_submodule :: (path: string) -> bool {
-    mode, ok := git_index_mode(path);
-    return ok && mode == "160000";
-}
-
-git_index_mode :: (path: string) -> (string, bool) {
-    command: [..] string;
-    array_add(*command, "git");
-    array_add(*command, "ls-files");
-    array_add(*command, "-s");
-    array_add(*command, "--");
-    array_add(*command, path);
-
-    ok, output, error := run_capture(command);
-    if !ok return "", false;
-
-    line := trim_right(output, " \t\r\n");
-    first_space := find_index_from_left(line, #char " ");
-    if first_space < 0 return "", false;
-    return slice(line, 0, first_space), true;
-}
-
-parse_status_z_changed_paths :: (text: string) -> [..] string {
-    paths: [..] string;
-    records := split_nul(text);
-    skip_next := false;
-
-    for record: records {
-        if skip_next {
-            skip_next = false;
-            continue;
-        }
-
-        if record.count < 4 continue;
-
-        path := slice(record, 3, record.count - 3);
-        array_add(*paths, path);
-
-        x := record[0];
-        if x == #char "R" || x == #char "C" skip_next = true;
-    }
-
-    return paths;
 }
 
 preflight_add_file_sizes :: (args: [] string) -> bool {
